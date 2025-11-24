@@ -1,0 +1,258 @@
+# =============================================================================
+# GBB Battery Forecast - Home Assistant Package
+# =============================================================================
+# Pobiera prognozę stanu baterii z GbbOptimizer przez MQTT i udostępnia
+# jako sensor do użycia w ApexCharts (lub innych wizualizacjach).
+#
+# INSTALACJA:
+# 1. Skopiuj ten plik do: /config/packages/gbb_battery_forecast.yaml
+# 2. Upewnij się, że packages są włączone w configuration.yaml:
+#
+#    homeassistant:
+#      packages: !include_dir_named packages
+#
+# 3. Dostosuj topiki MQTT do swojej konfiguracji (linia 42)
+# 4. Restart Home Assistant
+#
+# WYMAGANIA:
+# - MQTT integration skonfigurowany i połączony z GbbOptimizer
+# - GbbOptimizer z aktywnym API MQTT
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# KONFIGURACJA - Dostosuj do swojego środowiska
+# -----------------------------------------------------------------------------
+# Zmień te wartości jeśli używasz innych topików MQTT:
+
+# Topic do wysyłania requestów (domyślnie: ha_gbb/dataserver/serverrequest)
+# Topic do odbierania odpowiedzi (domyślnie: ha_gbb/dataserver/serverresponse)
+
+
+# =============================================================================
+# TEMPLATE SENSOR
+# =============================================================================
+# Trigger-based sensor który automatycznie aktualizuje się po otrzymaniu
+# odpowiedzi MQTT z GbbOptimizer
+
+template:
+  - trigger:
+      # Trigger: Odbiera odpowiedź z GbbOptimizer przez MQTT
+      - platform: mqtt
+        topic: "ha_gbb/dataserver/serverresponse"
+        id: "mqtt_response"
+    sensor:
+      - name: "GBB Battery Forecast"
+        unique_id: gbb_battery_forecast
+        # Stan sensora = aktualny prognozowany SOC
+        state: >-
+          {% if trigger.id == 'mqtt_response' %}
+            {% set data = trigger.payload | from_json %}
+            {% if data.Status == 'OK' and data.BatteryForecast_GetChartData is defined %}
+              {% set forecast = data.BatteryForecast_GetChartData %}
+              {% set now_hour = now().hour %}
+              {% set today = now().strftime('%Y-%m-%d') %}
+              {% for item in forecast if item.Date[:10] == today and item.Hour >= now_hour %}
+                {% if loop.first %}
+                  {{ item.StartBattery_Perc | round(1) }}
+                {% endif %}
+              {% else %}
+                {{ this.state | default('unknown') }}
+              {% endfor %}
+            {% else %}
+              {{ this.state | default('unknown') }}
+            {% endif %}
+          {% else %}
+            {{ this.state | default('unknown') }}
+          {% endif %}
+        unit_of_measurement: "%"
+        device_class: battery
+        icon: mdi:battery-clock
+        attributes:
+          # -----------------------------------------------------------------
+          # soc_forecast - Główny atrybut używany przez ApexCharts
+          # Format: [{"timestamp": "ISO8601", "soc": float}, ...]
+          # Zawiera tylko przyszłe godziny (od teraz do końca prognozy)
+          # -----------------------------------------------------------------
+          soc_forecast: >-
+            {% if trigger.id == 'mqtt_response' %}
+              {% set data = trigger.payload | from_json %}
+              {% if data.Status == 'OK' and data.BatteryForecast_GetChartData is defined %}
+                {% set forecast = data.BatteryForecast_GetChartData %}
+                {% set now_ts = as_timestamp(now().replace(minute=0, second=0, microsecond=0)) %}
+                {% set result = namespace(items=[]) %}
+                {% for item in forecast %}
+                  {% set item_date = item.Date[:10] %}
+                  {% set item_hour = item.Hour | int %}
+                  {% set item_ts = as_timestamp(strptime(item_date ~ ' ' ~ '%02d' | format(item_hour) ~ ':00:00', '%Y-%m-%d %H:%M:%S')) %}
+                  {% if item_ts >= now_ts %}
+                    {% set entry = {
+                      'timestamp': item_date ~ 'T' ~ '%02d' | format(item_hour) ~ ':00:00',
+                      'soc': item.StartBattery_Perc | round(1)
+                    } %}
+                    {% set result.items = result.items + [entry] %}
+                  {% endif %}
+                {% endfor %}
+                {{ result.items | to_json }}
+              {% else %}
+                {{ this.attributes.soc_forecast | default('[]') }}
+              {% endif %}
+            {% else %}
+              {{ this.attributes.soc_forecast | default('[]') }}
+            {% endif %}
+
+          # -----------------------------------------------------------------
+          # full_forecast - Pełna prognoza (wszystkie godziny)
+          # -----------------------------------------------------------------
+          full_forecast: >-
+            {% if trigger.id == 'mqtt_response' %}
+              {% set data = trigger.payload | from_json %}
+              {% if data.Status == 'OK' and data.BatteryForecast_GetChartData is defined %}
+                {% set forecast = data.BatteryForecast_GetChartData %}
+                {% set result = namespace(items=[]) %}
+                {% for item in forecast %}
+                  {% set item_date = item.Date[:10] %}
+                  {% set item_hour = item.Hour | int %}
+                  {% set entry = {
+                    'timestamp': item_date ~ 'T' ~ '%02d' | format(item_hour) ~ ':00:00',
+                    'soc': item.StartBattery_Perc | round(1)
+                  } %}
+                  {% set result.items = result.items + [entry] %}
+                {% endfor %}
+                {{ result.items | to_json }}
+              {% else %}
+                {{ this.attributes.full_forecast | default('[]') }}
+              {% endif %}
+            {% else %}
+              {{ this.attributes.full_forecast | default('[]') }}
+            {% endif %}
+
+          # -----------------------------------------------------------------
+          # Metadata
+          # -----------------------------------------------------------------
+          last_update: >-
+            {% if trigger.id == 'mqtt_response' %}
+              {{ now().isoformat() }}
+            {% else %}
+              {{ this.attributes.last_update | default('never') }}
+            {% endif %}
+
+          forecast_count: >-
+            {% if trigger.id == 'mqtt_response' %}
+              {% set data = trigger.payload | from_json %}
+              {% if data.Status == 'OK' and data.BatteryForecast_GetChartData is defined %}
+                {% set forecast = data.BatteryForecast_GetChartData %}
+                {% set now_ts = as_timestamp(now().replace(minute=0, second=0, microsecond=0)) %}
+                {% set count = namespace(value=0) %}
+                {% for item in forecast %}
+                  {% set item_date = item.Date[:10] %}
+                  {% set item_hour = item.Hour | int %}
+                  {% set item_ts = as_timestamp(strptime(item_date ~ ' ' ~ '%02d' | format(item_hour) ~ ':00:00', '%Y-%m-%d %H:%M:%S')) %}
+                  {% if item_ts >= now_ts %}
+                    {% set count.value = count.value + 1 %}
+                  {% endif %}
+                {% endfor %}
+                {{ count.value }}
+              {% else %}
+                {{ this.attributes.forecast_count | default(0) }}
+              {% endif %}
+            {% else %}
+              {{ this.attributes.forecast_count | default(0) }}
+            {% endif %}
+
+
+# =============================================================================
+# INPUT BUTTON - Przycisk do ręcznego odświeżenia
+# =============================================================================
+
+input_button:
+  gbb_forecast_refresh:
+    name: "Odśwież prognozę GBB"
+    icon: mdi:refresh
+
+
+# =============================================================================
+# AUTOMATYZACJE
+# =============================================================================
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Automatyczne pobieranie prognozy co 5 minut
+  # ---------------------------------------------------------------------------
+  - id: gbb_forecast_request_periodic
+    alias: "GBB Forecast - Request co 5 minut"
+    description: "Wysyła request do GbbOptimizer o prognozę baterii co 5 minut"
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "ha_gbb/dataserver/serverrequest"
+          payload: '{"Operation": "BatteryForecast_GetChartData"}'
+          qos: 1
+    mode: single
+
+  # ---------------------------------------------------------------------------
+  # Pobieranie prognozy przy starcie Home Assistant
+  # ---------------------------------------------------------------------------
+  - id: gbb_forecast_request_on_start
+    alias: "GBB Forecast - Request przy starcie HA"
+    description: "Wysyła request po uruchomieniu Home Assistant"
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - delay:
+          seconds: 30  # Poczekaj aż MQTT się połączy
+      - service: mqtt.publish
+        data:
+          topic: "ha_gbb/dataserver/serverrequest"
+          payload: '{"Operation": "BatteryForecast_GetChartData"}'
+          qos: 1
+    mode: single
+
+  # ---------------------------------------------------------------------------
+  # Ręczne pobieranie prognozy (przycisk)
+  # ---------------------------------------------------------------------------
+  - id: gbb_forecast_request_manual
+    alias: "GBB Forecast - Ręczny request"
+    description: "Pozwala ręcznie wywołać request przez przycisk w UI"
+    trigger:
+      - platform: state
+        entity_id: input_button.gbb_forecast_refresh
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "ha_gbb/dataserver/serverrequest"
+          payload: '{"Operation": "BatteryForecast_GetChartData"}'
+          qos: 1
+    mode: single
+
+
+# =============================================================================
+# UŻYCIE W APEXCHARTS
+# =============================================================================
+# Dodaj do swojego wykresu ApexCharts:
+#
+# - entity: sensor.gbb_battery_forecast
+#   type: line
+#   yaxis_id: battery-soc
+#   name: Battery Forecast
+#   color: "#00BFFF"
+#   stroke_width: 2
+#   stroke_dash: 5  # Linia przerywana
+#   show:
+#     extremas: false
+#     legend_value: true
+#     in_header: raw
+#   data_generator: |
+#     let forecast = entity.attributes.soc_forecast;
+#     if (typeof forecast === 'string') {
+#       try { forecast = JSON.parse(forecast); } catch (e) { return []; }
+#     }
+#     if (!forecast || !Array.isArray(forecast)) return [];
+#     return forecast.map(item => [new Date(item.timestamp).getTime(), item.soc]);
+#
+# =============================================================================
+
